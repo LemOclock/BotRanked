@@ -1,0 +1,16 @@
+{
+  "name": "botranked",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "db:sync": "node src/db/sync.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "dotenv": "^16.0.0",
+    "pg": "^8.0.0",
+    "pg-hstore": "^2.3.4",
+    "sequelize": "^6.32.1"
+  }
+}
