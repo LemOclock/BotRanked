@@ -488,15 +488,16 @@ async function buildDraftPayload(channel, state) {
       const user = await User.findOne({ where: { discordId: id } });
       const points = user?.points || 1000;
       const member = await guild.members.fetch(id);
-      const name = member.displayName || member.user.username;
+      // Use username only, not displayName (which might include points already)
+      const name = member.user.username;
       playersList += `${points} - ${name}\n`;
-    } catch {
+    } catch (err) {
       playersList += `1000 - <@${id}>\n`;
     }
   }
 
   const components = await buildPickRows(guild, channel.id, state);
-  return { content: `Players:\n${playersList}`, embeds: [embed], components };
+  return { embeds: [embed], components };
 }
 
 async function buildPickRows(guild, channelId, state) {
