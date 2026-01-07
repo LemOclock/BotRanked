@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/bot.js",
-    "db:sync": "node src/db/sync.js"
+    "db:sync": "node src/db/sync.js",
+    "db:reset": "node src/db/reset.js"
   },
   "dependencies": {
     "discord.js": "^14.11.0",

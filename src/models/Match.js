@@ -10,7 +10,10 @@ Match.init({
 	sequelize,
 	modelName: 'Match',
 	tableName: 'matches',
-	timestamps: true
+	timestamps: true,
+	indexes: [
+		{ fields: ['status'] }
+	]
 });
 
 export default Match;

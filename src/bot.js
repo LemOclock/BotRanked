@@ -4,8 +4,9 @@ dotenv.config();
 import { Client, GatewayIntentBits, Events, REST, Routes } from 'discord.js';
 import sequelize from './database.js';
 import { ensureRegisterMessage, setupRegister } from './register.js';
-import { ensureQueueMessage, setupQueue } from './queue.js';
-import { setupStats, getLeaderboardCommand } from './stats.js';
+import { ensureQueueMessage, setupQueue, getDodgeCommand, getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from './queue.js';
+import { setupStats, getLeaderboardCommand, getStatsCommand, ensureStatsAndLeaderboardMessages } from './stats.js';
+import { setupTickets, getDeleteTicketCommand, getInvitePlayerTicketCommand, ensureTicketMessage } from './tickets.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -38,20 +39,31 @@ client.once(Events.ClientReady, async () => {
     setTimeout(() => process.exit(1), 2000);
   }
 
-  if (CLIENT_ID) {
-    try {
-      const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-      const commands = [getLeaderboardCommand().toJSON()];
-      await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-      console.log('Slash commands registered');
-    } catch (err) {
-      console.error('Failed to register commands:', err);
-    }
-  }
-
   for (const guild of client.guilds.cache.values()) {
+    if (CLIENT_ID) {
+      try {
+        const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+        const commands = [
+          getLeaderboardCommand().toJSON(), 
+          getStatsCommand().toJSON(), 
+          getDeleteTicketCommand().toJSON(), 
+          getInvitePlayerTicketCommand().toJSON(),
+          getDodgeCommand().toJSON(),
+          getResetMatchCommand().toJSON(),
+          getBanPlayerCommand().toJSON(),
+          getUnbanPlayerCommand().toJSON(),
+          getEditPlayerStatsCommand().toJSON()
+        ];
+        await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: commands });
+        console.log(`Slash commands registered for guild ${guild.name}`);
+      } catch (err) {
+        console.error('Failed to register commands:', err);
+      }
+    }
     try { await ensureRegisterMessage(client, guild); } catch (err) { console.error('ensureRegisterMessage error', err); }
     try { await ensureQueueMessage(client, guild); } catch (err) { console.error('ensureQueueMessage error', err); }
+    try { await ensureStatsAndLeaderboardMessages(client, guild); } catch (err) { console.error('ensureStatsAndLeaderboardMessages error', err); }
+    try { await ensureTicketMessage(client, guild); } catch (err) { console.error('ensureTicketMessage error', err); }
   }
 });
 
@@ -66,5 +78,6 @@ process.on('unhandledRejection', err => {
 setupRegister(client);
 setupQueue(client);
 setupStats(client);
+setupTickets(client);
 
 client.login(BOT_TOKEN);

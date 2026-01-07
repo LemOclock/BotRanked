@@ -10,7 +10,11 @@ Vote.init({
   sequelize,
   modelName: 'Vote',
   tableName: 'votes',
-  timestamps: true
+  timestamps: true,
+  indexes: [
+    { fields: ['matchId'] },
+    { fields: ['voterDiscordId'] }
+  ]
 });
 
 export default Vote;

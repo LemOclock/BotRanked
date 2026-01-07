@@ -10,7 +10,10 @@ MatchPlayer.init({
   sequelize,
   modelName: 'MatchPlayer',
   tableName: 'match_players',
-  timestamps: false
+  timestamps: false,
+  indexes: [
+    { fields: ['matchId'] }
+  ]
 });
 
 export default MatchPlayer;

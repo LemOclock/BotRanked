@@ -11,11 +11,24 @@ User.init({
   },
   username: {
     type: DataTypes.STRING(100),
-    allowNull: false
+    allowNull: false,
+    unique: true,
+    validate: {
+      len: {
+        args: [2, 100],
+        msg: 'Username must be 2-100 characters'
+      }
+    }
   },
   points: {
     type: DataTypes.INTEGER,
-    defaultValue: 1000
+    defaultValue: 1000,
+    validate: {
+      min: {
+        args: [0],
+        msg: 'Points cannot be negative'
+      }
+    }
   },
   wins: {
     type: DataTypes.INTEGER,
