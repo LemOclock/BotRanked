@@ -4,7 +4,8 @@ dotenv.config();
 import { Client, GatewayIntentBits, Events, REST, Routes } from 'discord.js';
 import sequelize from './database.js';
 import { ensureRegisterMessage, setupRegister } from './register.js';
-import { ensureQueueMessage, setupQueue, getDodgeCommand, getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from './queue.js';
+import { ensureQueueMessage, setupQueue, getDodgeCommand } from './queue.js';
+import { getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from './features/admin-commands.js';
 import { setupStats, getLeaderboardCommand, getStatsCommand, ensureStatsAndLeaderboardMessages } from './stats.js';
 import { setupTickets, getDeleteTicketCommand, getInvitePlayerTicketCommand, ensureTicketMessage } from './tickets.js';
 

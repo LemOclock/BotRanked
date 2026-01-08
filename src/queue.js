@@ -1,6 +1,11 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, ChannelType, PermissionFlagsBits, MessageFlags, SlashCommandBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, ChannelType, PermissionFlagsBits, MessageFlags, SlashCommandBuilder } from "discord.js";
 import { Match, Team, MatchPlayer, Vote, User } from "./models/index.js";
 import { ensureStatsAndLeaderboardMessages } from "./stats.js";
+import { syncPlayerRankLimiter, userUpdateLimiter } from "./utils/rate-limiter.js";
+import { startMemoryCleanup } from "./utils/memory-cleanup.js";
+import { getCachedUser, invalidateUserCache } from "./utils/user-cache.js";
+import { ensureCurrentQueueMessage, scheduleCurrentQueueUpdate } from "./features/current-queue.js";
+import { setupAdminCommands, getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from "./features/admin-commands.js";
 
 const QUEUE_CHANNEL_NAME = "v3-general";
 const QUEUE_ADVANCED_CHANNEL_NAME = "v3-advanced";
@@ -21,37 +26,6 @@ const DODGE_BAN_DURATION = 60 * 60 * 1000; // 1 hour in ms
 const DODGE_TIME_LIMIT = 5 * 60 * 1000; // 5 minutes in ms
 const COOLDOWN_TTL = 60 * 60 * 1000; // Cleanup cooldowns after 1 hour
 const MATCH_TTL = 12 * 60 * 60 * 1000; // Cleanup match states after 12 hours (fail-safe)
-
-// Rate limiting for Discord API calls
-class RateLimiter {
-  constructor(maxRequests = 5, windowMs = 1000) {
-    this.maxRequests = maxRequests;
-    this.windowMs = windowMs;
-    this.requests = [];
-  }
-
-  async wait() {
-    const now = Date.now();
-    // Remove old requests outside the window
-    this.requests = this.requests.filter(t => now - t < this.windowMs);
-    
-    if (this.requests.length >= this.maxRequests) {
-      const oldestRequest = this.requests[0];
-      const waitTime = this.windowMs - (now - oldestRequest);
-      if (waitTime > 0) {
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        return this.wait(); // Recurse after waiting
-      }
-    }
-    
-    this.requests.push(now);
-  }
-}
-
-// Create rate limiters for different types of API calls
-const syncPlayerRankLimiter = new RateLimiter(10, 1000); // 10 per second
-const userUpdateLimiter = new RateLimiter(15, 1000); // 15 per second (less restrictive)
-const messageLimiter = new RateLimiter(20, 1000); // 20 per second (message sends)
 
 // Queue role restrictions
 const QUEUE_ROLES = {
@@ -86,46 +60,36 @@ const MAP_IMAGES = {
 };
 
 const queues = new Map(); // guildId-channelName -> Set of user IDs
+const queueLocks = new Map(); // guildId-channelName -> { locked: bool, waiters: [] } to prevent race conditions
 const matches = new Map();
 const voteUpdateQueues = new Map(); // Queue vote updates per matchId to throttle API calls
 const creatingGamesInGuild = new Map(); // guildId-channelName -> Promise (prevent simultaneous game creation with proper locking)
 const buttonCooldowns = new Map(); // userId -> { timestamp, createdAt } for anti-spam + TTL
 const dodgeBans = new Map(); // userId -> { timestamp, createdAt } when ban expires
 
-// Cleanup interval: Remove expired cooldowns and old matches (every 30 minutes)
-const CLEANUP_INTERVAL = 30 * 60 * 1000;
-setInterval(() => {
-  const now = Date.now();
-  
-  // Clean up button cooldowns
-  for (const [userId, data] of buttonCooldowns.entries()) {
-    if (now - data.createdAt > COOLDOWN_TTL) {
-      buttonCooldowns.delete(userId);
-    }
-  }
-  
-  // Clean up dodge bans
-  for (const [userId, data] of dodgeBans.entries()) {
-    if (now - data.createdAt > DODGE_BAN_DURATION + 1000) {
-      dodgeBans.delete(userId);
-    }
-  }
-  
-  // Clean up old match states
-  for (const [channelId, state] of matches.entries()) {
-    if (now - state.createdAt > MATCH_TTL) {
-      matches.delete(channelId);
-      voteUpdateQueues.delete(state.matchId);
-    }
-  }
-  
-  console.log(`[Cleanup] Cleared expired data: cooldowns=${buttonCooldowns.size}, bans=${dodgeBans.size}, matches=${matches.size}`);
-}, CLEANUP_INTERVAL);
+// Start memory cleanup service
+startMemoryCleanup(buttonCooldowns, dodgeBans, matches, voteUpdateQueues);
 
 function getQueue(guildId, channelName = QUEUE_CHANNEL_NAME) {
   const key = `${guildId}-${channelName}`;
   if (!queues.has(key)) queues.set(key, new Set());
   return queues.get(key);
+}
+
+function getQueueLock(guildId, channelName = QUEUE_CHANNEL_NAME) {
+  const key = `${guildId}-${channelName}`;
+  if (!queueLocks.has(key)) queueLocks.set(key, { locked: false });
+  return queueLocks.get(key);
+}
+
+// Acquire lock for queue operations to prevent race conditions
+async function acquireQueueLock(guildId, channelName = QUEUE_CHANNEL_NAME) {
+  const lock = getQueueLock(guildId, channelName);
+  while (lock.locked) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  lock.locked = true;
+  return () => { lock.locked = false; }; // Returns unlock function
 }
 
 function getCreatingGamesSet(guildId, channelName = QUEUE_CHANNEL_NAME) {
@@ -204,7 +168,7 @@ export async function ensureQueueMessage(client, guild) {
   await ensureQueueMessageForChannel(client, guild, QUEUE_CHALLENGER_CHANNEL_NAME);
   await ensureQueueMessageForChannel(client, guild, QUEUE_ELITE_CHANNEL_NAME);
   await ensureQueueMessageForChannel(client, guild, QUEUE_PRO_CHANNEL_NAME);
-  await ensureCurrentQueueMessage(client, guild);
+  await ensureCurrentQueueMessage(client, guild, getQueue);
 }
 
 async function ensureQueueMessageForChannel(client, guild, channelName) {
@@ -229,68 +193,6 @@ async function ensureQueueMessageForChannel(client, guild, channelName) {
 
 async function updateQueueMessage(client, guild, channelName = QUEUE_CHANNEL_NAME) {
   return ensureQueueMessageForChannel(client, guild, channelName);
-}
-
-async function buildCurrentQueueEmbed(guild) {
-  const allChannels = [QUEUE_CHANNEL_NAME, QUEUE_ADVANCED_CHANNEL_NAME, QUEUE_CHALLENGER_CHANNEL_NAME, QUEUE_ELITE_CHANNEL_NAME, QUEUE_PRO_CHANNEL_NAME];
-  
-  let description = '';
-  
-  for (const channelName of allChannels) {
-    const queue = getQueue(guild.id, channelName);
-    let displayName = 'General';
-    if (channelName === QUEUE_ADVANCED_CHANNEL_NAME) displayName = 'Advanced';
-    else if (channelName === QUEUE_CHALLENGER_CHANNEL_NAME) displayName = 'Challenger';
-    else if (channelName === QUEUE_ELITE_CHANNEL_NAME) displayName = 'Elite';
-    else if (channelName === QUEUE_PRO_CHANNEL_NAME) displayName = 'Pro';
-    
-    description += `\n**${displayName}** [${queue.size}/${QUEUE_SIZE}]\n`;
-    
-    if (queue.size === 0) {
-      description += '  *Empty*\n';
-    } else {
-      const players = await User.findAll({ where: { discordId: [...queue] } }).catch(() => []);
-      const playersWithPoints = [...queue].map(uid => {
-        const user = players.find(u => u.discordId === uid);
-        const points = user?.points || 1000;
-        const rank = getRankByPoints(points);
-        const pseudo = user?.username || uid;
-        return { uid, pseudo, points, rank };
-      }).sort((a, b) => b.points - a.points);
-      
-      for (const { uid, pseudo, points, rank } of playersWithPoints) {
-        description += `  • <@${uid}> - **${pseudo}** (${points} pts) [${rank}]\n`;
-      }
-    }
-  }
-  
-  return new EmbedBuilder()
-    .setTitle('📊 Current Queues')
-    .setDescription(description)
-    .setColor('#00ff00')
-    .setFooter({ text: guild.name, iconURL: guild.iconURL() });
-}
-
-async function ensureCurrentQueueMessage(client, guild) {
-  const channel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name === 'current-q');
-  if (!channel) return;
-
-  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-  const existing = messages?.find(m => m.author?.id === client.user.id && m.embeds?.some(e => e.title === '📊 Current Queues'));
-
-  const embed = await buildCurrentQueueEmbed(guild);
-
-  if (existing) {
-    try {
-      await existing.edit({ embeds: [embed] });
-    } catch {}
-  } else {
-    await channel.send({ embeds: [embed] });
-  }
-}
-
-async function updateCurrentQueueMessage(client, guild) {
-  return ensureCurrentQueueMessage(client, guild);
 }
 
 async function persistMatchSetup(channel, state) {
@@ -459,6 +361,12 @@ async function createGameChannelForSix(client, guild, playerIds, queueChannelNam
   matches.set(textChannel.id, state);
   await persistMatchSetup(textChannel, state);
 
+  // Ping all players in the newly created match channel
+  try {
+    const mentions = playerIds.map(id => `<@${id}>`).join(' ');
+    await textChannel.send({ content: `Match created. ${mentions}` });
+  } catch {}
+
   return state;
 }
 
@@ -485,7 +393,7 @@ async function buildDraftPayload(channel, state) {
   let playersList = "";
   for (const id of state.players) {
     try {
-      const user = await User.findOne({ where: { discordId: id } });
+      const user = await getCachedUser(id);
       const points = user?.points || 1000;
       const member = await guild.members.fetch(id);
       // Use username only, not displayName (which might include points already)
@@ -510,8 +418,13 @@ async function buildPickRows(guild, channelId, state) {
   for (const uid of remaining) {
     let label = uid;
     try {
-      const m = await guild.members.fetch(uid);
-      label = m.displayName || m.user.username;
+      const cached = await getCachedUser(uid);
+      if (cached?.username) {
+        label = cached.username;
+      } else {
+        const m = await guild.members.fetch(uid);
+        label = m.user?.username || m.displayName || uid;
+      }
     } catch {}
     const btn = new ButtonBuilder().setCustomId(`pick:${channelId}:${uid}`).setLabel(label).setStyle(ButtonStyle.Secondary);
     currentRow.addComponents(btn);
@@ -637,7 +550,7 @@ async function tryFinalize(channel, state) {
 
     const beforeStats = {};
     for (const uid of [...winners, ...losers]) {
-      const user = await User.findOne({ where: { discordId: uid } }).catch(() => null);
+      const user = await getCachedUser(uid);
       beforeStats[uid] = user ? { points: user.points || 1000 } : { points: 1000 };
     }
 
@@ -663,27 +576,30 @@ async function tryFinalize(channel, state) {
       // Sync ranks for all players
       const guild = channel.guild;
       for (const wid of winners) {
-        const user = await User.findOne({ where: { discordId: wid } });
+        const user = await getCachedUser(wid);
         if (user) await syncPlayerRank(guild, wid, user.points);
       }
       for (const lid of losers) {
-        const user = await User.findOne({ where: { discordId: lid } });
+        const user = await getCachedUser(lid);
         if (user) await syncPlayerRank(guild, lid, user.points);
       }
+
+      // Invalidate cache for all players after match finalization
+      invalidateUserCache([...winners, ...losers]);
 
       state.finalized = true;
     }
 
     const gameId = channel.name.split("-")[0];
-    const winnerTeamName = winnerKey === "A" ? "Alpha" : "Beta";
-    const loserTeamName = winnerKey === "A" ? "Beta" : "Alpha";
+    const winnerTeamName = winnerKey === "A" ? "Team A" : "Team B";
+    const loserTeamName = winnerKey === "A" ? "Team B" : "Team A";
 
     let resultsMsg = `**Game ${gameId} — Results**\n`;
     resultsMsg += `Map: ${state.selectedMap}\n`;
     resultsMsg += `Queue: General Queue V3\n\n`;
     resultsMsg += `**Winner Team: (${winnerTeamName})**\n`;
     for (const wid of winners) {
-      const user = await User.findOne({ where: { discordId: wid } }).catch(() => null);
+      const user = await getCachedUser(wid);
       const after = user?.points || (beforeStats[wid]?.points || 1000) + POINTS_WIN;
       const before = beforeStats[wid]?.points || 1000;
       const delta = after - before;
@@ -693,7 +609,7 @@ async function tryFinalize(channel, state) {
     }
     resultsMsg += `\n**Loser Team: (${loserTeamName})**\n`;
     for (const lid of losers) {
-      const user = await User.findOne({ where: { discordId: lid } }).catch(() => null);
+      const user = await getCachedUser(lid);
       const after = user?.points || (beforeStats[lid]?.points || 1000) - POINTS_LOSS;
       const before = beforeStats[lid]?.points || 1000;
       const delta = after - before;
@@ -729,11 +645,27 @@ async function tryFinalize(channel, state) {
   }
 }
 
+// Interaction deduplication to prevent double processing
+const processedInteractions = new Set();
+setInterval(() => {
+  processedInteractions.clear(); // Clear every 5 minutes
+}, 5 * 60 * 1000);
+
 export function setupQueue(client) {
+  // Setup admin commands
+  setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues);
+  
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
-      if (!interaction.isButton()) return;
-
+      // Deduplicate: skip if already processed (only for actual duplicates from Discord)
+      if (processedInteractions.has(interaction.id)) {
+        console.log(`Duplicate interaction blocked: ${interaction.id}`);
+        return;
+      }
+      
+      // Mark as processed immediately to prevent double-processing
+      processedInteractions.add(interaction.id);
+      
       // Helper to respond safely to button interactions (handles already-acknowledged cases)
       const safeEphemeral = async (content) => {
         try {
@@ -751,6 +683,66 @@ export function setupQueue(client) {
           }
         }
       };
+
+      // Handle slash commands first (before button check)
+      if (interaction.isChatInputCommand() && interaction.commandName === 'dodge') {
+        // Defer immediately for slash commands
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+        
+        const channelId = interaction.channelId;
+        const state = matches.get(channelId);
+        const userId = interaction.user.id;
+
+        if (!state) {
+          await interaction.editReply({ content: 'This command can only be used in an active match channel.' });
+          return;
+        }
+
+        if (!state.players.has(userId)) {
+          await interaction.editReply({ content: 'Only players in this match can dodge.' });
+          return;
+        }
+
+        if (!state.voteStartTime) {
+          await interaction.editReply({ content: 'You can only dodge after the map bans are complete.' });
+          return;
+        }
+
+        const elapsedTime = Date.now() - state.voteStartTime;
+        if (elapsedTime > DODGE_TIME_LIMIT) {
+          await interaction.editReply({ content: 'Dodge window expired (5 minutes after map bans).' });
+          return;
+        }
+
+        // Ban the dodger for 1 hour
+        const banExpiry = Date.now() + DODGE_BAN_DURATION;
+        dodgeBans.set(userId, { timestamp: banExpiry, createdAt: Date.now() });
+
+        // Notify all players in the match
+        const playerMentions = [...state.players].map(id => `<@${id}>`).join(' ');
+        await interaction.channel.send(`**Match cancelled**: <@${userId}> dodged the match and is banned from queue for 1 hour.\n${playerMentions}`);
+
+        // Mark match as cancelled in DB
+        if (state.matchId) {
+          await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
+        }
+
+        // Clean up
+        matches.delete(channelId);
+        voteUpdateQueues.delete(state.matchId);
+
+        await interaction.editReply({ content: 'You dodged the match. You are banned from queue for 1 hour.' });
+
+        // Delete channel after 5 seconds
+        setTimeout(() => {
+          try { interaction.channel.delete().catch(() => {}); } catch {}
+        }, 5000);
+
+        return;
+      }
+
+      // Handle button interactions
+      if (!interaction.isButton()) return;
 
       if (interaction.customId === "queue_join" || interaction.customId === "queue_leave") {
         const guild = interaction.guild;
@@ -770,7 +762,7 @@ export function setupQueue(client) {
           channelName = QUEUE_PRO_CHANNEL_NAME;
         }
         
-        // Anti-spam cooldown check
+        // Anti-spam cooldown check (BEFORE setting cooldown to prevent race)
         const lastClick = buttonCooldowns.get(memberId);
         const now = Date.now();
         if (lastClick && (now - lastClick.timestamp) < BUTTON_COOLDOWN) {
@@ -778,46 +770,82 @@ export function setupQueue(client) {
           await safeEphemeral(`Please wait ${timeLeft}s before clicking again.`);
           return;
         }
+        
+        // Defer after validation to prevent timeout on game creation
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+        
+        // Set cooldown AFTER validation but BEFORE processing
         buttonCooldowns.set(memberId, { timestamp: now, createdAt: now });
         
         const q = getQueue(guildId, channelName);
 
         if (interaction.customId === "queue_join") {
-          // Check if already in another queue
-          const otherQueue = isUserInOtherQueue(memberId, channelName, guildId);
-          if (otherQueue) {
-            await safeEphemeral(`You are already in the ${otherQueue} queue. Please leave it first.`);
-            return;
-          }
+          const q = getQueue(guildId, channelName);
           
-          // Check role restrictions for any queue that requires roles
-          const requiredRoles = QUEUE_ROLES[channelName];
-          if (requiredRoles && requiredRoles.length > 0) {
-            const hasRole = interaction.member.roles.cache.some(r => requiredRoles.includes(r.name.toLowerCase()));
-            if (!hasRole) {
-              await safeEphemeral(`You need one of these roles to join: ${requiredRoles.join(', ')}.`);
+          // Acquire lock to prevent race condition on queue check/add
+          const unlockQueue = await acquireQueueLock(guildId, channelName);
+          try {
+            // SIMPLE: Check if already in queue - if yes, reject. If no, allow if passes checks.
+            if (q.has(memberId)) {
+              console.log(`[Queue] Player ${memberId} already in ${channelName}. Queue: ${[...q].join(', ')}`);
+              await safeEphemeral("You already in queue.");
               return;
             }
+            
+            // Not in queue yet - check if allowed to join
+            const otherQueue = isUserInOtherQueue(memberId, channelName, guildId);
+            if (otherQueue) {
+              console.log(`[Queue] Player ${memberId} already in ${otherQueue}`);
+              await safeEphemeral(`You are already in the ${otherQueue} queue. Please leave it first.`);
+              return;
+            }
+            
+            const requiredRoles = QUEUE_ROLES[channelName];
+            if (requiredRoles && requiredRoles.length > 0) {
+              const hasRole = interaction.member.roles.cache.some(r => requiredRoles.includes(r.name.toLowerCase()));
+              if (!hasRole) {
+                await safeEphemeral(`You need one of these roles to join: ${requiredRoles.join(', ')}.`);
+                return;
+              }
+            }
+            
+            if (isUserDodgeBanned(memberId)) {
+              const timeLeft = getDodgeBanTimeLeft(memberId);
+              await safeEphemeral(`You are banned from queue for ${timeLeft} more minutes (dodged a match).`);
+              return;
+            }
+            
+            if (isUserInActiveMatch(memberId)) {
+              await safeEphemeral("You already in game.");
+              return;
+            }
+            
+            // All checks passed - add to queue
+            q.add(memberId);
+            console.log(`[Queue] ✓ Player ${memberId} JOINED ${channelName}. Queue size: ${q.size}/${QUEUE_SIZE}. Members: ${[...q].join(', ')}`);
+            await safeEphemeral("You joined the queue.");
+          } finally {
+            unlockQueue();
           }
-          
-          if (isUserDodgeBanned(memberId)) {
-            const timeLeft = getDodgeBanTimeLeft(memberId);
-            await safeEphemeral(`You are banned from queue for ${timeLeft} more minutes (dodged a match).`);
-            return;
-          }
-          if (isUserInActiveMatch(memberId)) {
-            await safeEphemeral("You already in game.");
-            return;
-          }
-          q.add(memberId);
-          await safeEphemeral("You joined the queue.");
         } else {
-          q.delete(memberId);
-          await safeEphemeral("You left the queue.");
+          // Leave queue
+          const unlockQueue = await acquireQueueLock(guildId, channelName);
+          try {
+            if (!q.has(memberId)) {
+              console.log(`[Queue] Player ${memberId} not in queue ${channelName}`);
+              await safeEphemeral("You are not in the queue.");
+              return;
+            }
+            q.delete(memberId);
+            console.log(`[Queue] ✓ Player ${memberId} LEFT ${channelName}. Queue size: ${q.size}/${QUEUE_SIZE}. Members: ${[...q].join(', ')}`);
+            await safeEphemeral("You left the queue.");
+          } finally {
+            unlockQueue();
+          }
         }
 
         await updateQueueMessage(client, guild, channelName);
-        await updateCurrentQueueMessage(client, guild);
+        scheduleCurrentQueueUpdate(client, guild, getQueue);
 
         // Acquire lock to prevent race conditions when creating game
         if (q.size >= QUEUE_SIZE && process.env.SIM_MODE !== '1') {
@@ -828,7 +856,7 @@ export function setupQueue(client) {
               const players = [...q].slice(0, QUEUE_SIZE);
               for (const id of players) q.delete(id);
               await updateQueueMessage(client, guild, channelName);
-              await updateCurrentQueueMessage(client, guild);
+              scheduleCurrentQueueUpdate(client, guild, getQueue);
               await createGameChannelForSix(client, guild, players, channelName);
             }
           } finally {
@@ -843,21 +871,24 @@ export function setupQueue(client) {
         if (interaction.channelId !== channelId) return;
         const state = matches.get(channelId);
         if (!state) {
-          await interaction.reply({ content: "Draft not active here.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Draft not active here.");
           return;
         }
+        
+        // Defer after validation to prevent timeout on DB operations
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
 
         const pickerId = interaction.user.id;
         if (state.phase === "A1" && pickerId !== state.captainA) {
-          await interaction.reply({ content: "Not your turn (Captain A picks first).", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Not your turn (Captain A picks first).");
           return;
         }
         if ((state.phase === "B1" || state.phase === "B2") && pickerId !== state.captainB) {
-          await interaction.reply({ content: "Not your turn (Captain B picking).", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Not your turn (Captain B picking).");
           return;
         }
         if (!state.remaining.has(pickedId)) {
-          await interaction.reply({ content: "Player already picked or invalid.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Player already picked or invalid.");
           return;
         }
 
@@ -892,7 +923,7 @@ export function setupQueue(client) {
           }
         } catch (e) { console.error("update draft message error", e); }
 
-        await interaction.reply({ content: "Pick enregistré.", flags: MessageFlags.Ephemeral });
+        await safeEphemeral("Pick enregistré.");
         return;
       }
 
@@ -901,20 +932,24 @@ export function setupQueue(client) {
         if (interaction.channelId !== channelId) return;
         const state = matches.get(channelId);
         if (!state || state.phase !== "BAN_A" && state.phase !== "BAN_B") {
-          await interaction.reply({ content: "Bans not active now.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Bans not active now.");
           return;
         }
+        
+        // Defer after validation to prevent timeout on map selection
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+        
         const bannerId = interaction.user.id;
         if (state.phase === "BAN_A" && bannerId !== state.captainA) {
-          await interaction.reply({ content: "Not your turn (Captain A bans first).", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Not your turn (Captain A bans first).");
           return;
         }
         if (state.phase === "BAN_B" && bannerId !== state.captainB) {
-          await interaction.reply({ content: "Not your turn (Captain B bans now).", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Not your turn (Captain B bans now).");
           return;
         }
         if (!state.availableMaps.includes(mapName)) {
-          await interaction.reply({ content: "Map already banned or invalid.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Map already banned or invalid.");
           return;
         }
         state.availableMaps = state.availableMaps.filter(m => m !== mapName);
@@ -956,7 +991,7 @@ export function setupQueue(client) {
             if (msg) await msg.edit({ embeds: [embed], components: rows });
           }
         } catch (e) { console.error("update ban message error", e); }
-        await interaction.reply({ content: "Ban enregistré.", flags: MessageFlags.Ephemeral });
+        await safeEphemeral("Ban enregistré.");
         return;
       }
 
@@ -965,22 +1000,26 @@ export function setupQueue(client) {
         if (interaction.channelId !== channelId) return;
         const state = matches.get(channelId);
         if (!state || !state.matchId) {
-          await interaction.reply({ content: "Voting not available.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Voting not available.");
           return;
         }
+        
+        // Defer after validation to prevent timeout on finalization
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+        
         const voterId = interaction.user.id;
         if (!state.players.has(voterId)) {
-          await interaction.reply({ content: "Only match players can vote.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Only match players can vote.");
           return;
         }
         const voteForTeamId = teamKey === "A" ? state.teamAId : state.teamBId;
         const existing = await Vote.findOne({ where: { matchId: state.matchId, voterDiscordId: voterId } });
         if (existing) {
           await existing.update({ voteForTeamId }).catch(() => {});
-          await interaction.reply({ content: "Vote updated.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Vote updated.");
         } else {
           await Vote.create({ matchId: state.matchId, voterDiscordId: voterId, voteForTeamId });
-          await interaction.reply({ content: "Vote counted.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("Vote counted.");
         }
         const finalized = await tryFinalize(interaction.channel, state);
         if (finalized) {
@@ -997,324 +1036,11 @@ export function setupQueue(client) {
       }
 
       // Handle /dodge command
-      if (interaction.isChatInputCommand() && interaction.commandName === 'dodge') {
-        const channelId = interaction.channelId;
-        const state = matches.get(channelId);
-        const userId = interaction.user.id;
-
-        if (!state) {
-          await interaction.reply({ content: 'This command can only be used in an active match channel.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        if (!state.players.has(userId)) {
-          await interaction.reply({ content: 'Only players in this match can dodge.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        if (!state.voteStartTime) {
-          await interaction.reply({ content: 'You can only dodge after the map bans are complete.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        const elapsedTime = Date.now() - state.voteStartTime;
-        if (elapsedTime > DODGE_TIME_LIMIT) {
-          await interaction.reply({ content: 'Dodge window expired (5 minutes after map bans).', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        // Ban the dodger for 1 hour
-        const banExpiry = Date.now() + DODGE_BAN_DURATION;
-        dodgeBans.set(userId, { timestamp: banExpiry, createdAt: Date.now() });
-
-        // Notify all players in the match
-        const playerMentions = [...state.players].map(id => `<@${id}>`).join(' ');
-        await interaction.channel.send(`**Match cancelled**: <@${userId}> dodged the match and is banned from queue for 1 hour.\n${playerMentions}`);
-
-        // Mark match as cancelled in DB
-        if (state.matchId) {
-          await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
-        }
-
-        // Clean up
-        matches.delete(channelId);
-        voteUpdateQueues.delete(state.matchId);
-
-        await interaction.reply({ content: 'You dodged the match. You are banned from queue for 1 hour.', flags: MessageFlags.Ephemeral });
-
-        // Delete channel after 5 seconds
-        setTimeout(() => {
-          try { interaction.channel.delete().catch(() => {}); } catch {}
-        }, 5000);
-
-        return;
-      }
+      // (Removed duplicate /dodge handler)
     } catch (err) {
       console.error("Queue interaction error", err);
-      if (!interaction.replied) {
+      if (!interaction.replied && !interaction.deferred) {
         try { await interaction.reply({ content: "Error handling queue action.", flags: MessageFlags.Ephemeral }); } catch {}
-      }
-    }
-  });
-
-  // Handle /ban-player command (admin only)
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'ban-player') return;
-
-    try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
-      if (!isAdmin) {
-        await interaction.reply({ content: 'Only admins can ban players.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const targetUser = interaction.options.getUser('player');
-      const durationStr = interaction.options.getString('duration');
-
-      // Parse duration (2h, 3h, 1j, 30m, etc.)
-      const match = durationStr.match(/^(\d+)(m|h|j|d)$/i);
-      if (!match) {
-        await interaction.reply({ content: 'Invalid duration format. Use: 30m, 2h, 1j (m=minutes, h=hours, j/d=days)', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const value = parseInt(match[1]);
-      const unit = match[2].toLowerCase();
-      let durationMs = 0;
-
-      if (unit === 'm') durationMs = value * 60 * 1000;
-      else if (unit === 'h') durationMs = value * 60 * 60 * 1000;
-      else if (unit === 'j' || unit === 'd') durationMs = value * 24 * 60 * 60 * 1000;
-
-      const banExpiry = Date.now() + durationMs;
-      dodgeBans.set(targetUser.id, { timestamp: banExpiry, createdAt: Date.now() });
-
-      // Post to #bann channel
-      try {
-        const guild = interaction.guild;
-        let bannChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name === 'bann');
-        if (!bannChannel) {
-          bannChannel = await guild.channels.create({ name: 'bann', type: ChannelType.GuildText });
-        }
-        await bannChannel.send(`<@${targetUser.id}> vous êtes banni ${durationStr}.`);
-      } catch (errBann) {
-        console.error('Error posting to bann channel:', errBann);
-      }
-
-      await interaction.reply({ content: `<@${targetUser.id}> banned from queue for ${durationStr}.`, flags: MessageFlags.Ephemeral });
-    } catch (err) {
-      console.error('Ban player error:', err);
-      if (!interaction.replied) {
-        await interaction.reply({ content: 'Error banning player.', flags: MessageFlags.Ephemeral }).catch(() => {});
-      }
-    }
-  });
-
-  // Handle /reset-match command (admin only)
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'reset-match') return;
-
-    try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
-      if (!isAdmin) {
-        await interaction.reply({ content: 'Only admins can reset matches.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const channel = interaction.options.getChannel('channel');
-      const state = matches.get(channel.id);
-
-      if (!state) {
-        await interaction.reply({ content: 'No active match found in that channel.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // Mark match as cancelled in DB
-      if (state.matchId) {
-        await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
-      }
-
-      // Clean up
-      matches.delete(channel.id);
-      voteUpdateQueues.delete(state.matchId);
-
-      await interaction.reply({ content: `Match in ${channel} has been reset. Channel will be deleted in 5 seconds.`, flags: MessageFlags.Ephemeral });
-
-      // Delete channel
-      setTimeout(() => {
-        try { channel.delete().catch(() => {}); } catch {}
-      }, 5000);
-
-    } catch (err) {
-      console.error('Reset match error:', err);
-      await interaction.reply({ content: 'Error resetting match.', flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
-  });
-
-  // Handle /unban-player command (admin only)
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'unban-player') return;
-
-    try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
-      if (!isAdmin) {
-        await interaction.reply({ content: 'Only admins can unban players.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const targetUser = interaction.options.getUser('player');
-
-      // Check if player is actually banned
-      if (!dodgeBans.has(targetUser.id)) {
-        await interaction.reply({ content: `<@${targetUser.id}> is not banned from queue.`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // Remove the ban
-      dodgeBans.delete(targetUser.id);
-
-      // Post to #bann channel
-      try {
-        const guild = interaction.guild;
-        let bannChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name === 'bann');
-        if (bannChannel) {
-          await bannChannel.send(`<@${targetUser.id}> a été débanni.`);
-        }
-      } catch (errBann) {
-        console.error('Error posting to bann channel:', errBann);
-      }
-
-      await interaction.reply({ content: `<@${targetUser.id}> unbanned from queue.`, flags: MessageFlags.Ephemeral });
-    } catch (err) {
-      console.error('Unban player error:', err);
-      if (!interaction.replied) {
-        await interaction.reply({ content: 'Error unbanning player.', flags: MessageFlags.Ephemeral }).catch(() => {});
-      }
-    }
-  });
-
-  // Handle /edit-player-stats command (admin only)
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'edit-player-stats') return;
-
-    try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
-      if (!isAdmin) {
-        await interaction.reply({ content: 'Only admins can edit player stats.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const targetUser = interaction.options.getUser('player');
-
-      // Get current stats
-      const user = await User.findOne({ where: { discordId: targetUser.id } });
-      if (!user) {
-        await interaction.reply({ content: `<@${targetUser.id}> is not registered in the system.`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // Create Modal with pre-filled stats
-      const modal = new ModalBuilder()
-        .setCustomId(`edit-stats-${targetUser.id}`)
-        .setTitle(`Edit ${user.username} Stats`);
-
-      const pointsInput = new TextInputBuilder()
-        .setCustomId('points-input')
-        .setLabel('Points')
-        .setStyle(TextInputStyle.Short)
-        .setValue(user.points.toString())
-        .setRequired(true);
-
-      const winsInput = new TextInputBuilder()
-        .setCustomId('wins-input')
-        .setLabel('Wins')
-        .setStyle(TextInputStyle.Short)
-        .setValue(user.wins.toString())
-        .setRequired(true);
-
-      const lossesInput = new TextInputBuilder()
-        .setCustomId('losses-input')
-        .setLabel('Losses')
-        .setStyle(TextInputStyle.Short)
-        .setValue(user.losses.toString())
-        .setRequired(true);
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(pointsInput),
-        new ActionRowBuilder().addComponents(winsInput),
-        new ActionRowBuilder().addComponents(lossesInput)
-      );
-
-      await interaction.showModal(modal);
-    } catch (err) {
-      console.error('Edit player stats error:', err);
-      if (!interaction.replied) {
-        await interaction.reply({ content: 'Error opening stats editor.', flags: MessageFlags.Ephemeral }).catch(() => {});
-      }
-    }
-  });
-
-  // Handle Modal submission for edit-player-stats
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isModalSubmit()) return;
-    if (!interaction.customId.startsWith('edit-stats-')) return;
-
-    try {
-      const targetUserId = interaction.customId.replace('edit-stats-', '');
-      
-      // Validate Discord ID format
-      if (!/^\d{17,19}$/.test(targetUserId)) {
-        await interaction.reply({ content: 'Invalid user ID.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const points = parseInt(interaction.fields.getTextInputValue('points-input'));
-      const wins = parseInt(interaction.fields.getTextInputValue('wins-input'));
-      const losses = parseInt(interaction.fields.getTextInputValue('losses-input'));
-
-      // Validate numbers
-      if (isNaN(points) || isNaN(wins) || isNaN(losses)) {
-        await interaction.reply({ content: 'All values must be valid numbers.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // Validate non-negative values
-      if (points < 0 || wins < 0 || losses < 0) {
-        await interaction.reply({ content: 'Points, wins, and losses must be >= 0.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // Get user and old values
-      const user = await User.findOne({ where: { discordId: targetUserId } });
-      if (!user) {
-        await interaction.reply({ content: 'Player not found.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const oldPoints = user.points;
-      const oldWins = user.wins;
-      const oldLosses = user.losses;
-
-      // Update stats
-      await user.update({ points, wins, losses });
-
-      // Sync rank after points update
-      await syncPlayerRank(interaction.guild, targetUserId, points);
-
-      const confirmMessage = `**${user.username}** stats updated:\n` +
-        `Points: **${oldPoints}** → **${points}**\n` +
-        `Wins: **${oldWins}** → **${wins}**\n` +
-        `Losses: **${oldLosses}** → **${losses}**`;
-
-      await interaction.reply({ content: confirmMessage, flags: MessageFlags.Ephemeral });
-    } catch (err) {
-      console.error('Edit player stats modal error:', err);
-      if (!interaction.replied) {
-        await interaction.reply({ content: 'Error updating player stats.', flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   });
@@ -1324,56 +1050,6 @@ export function getDodgeCommand() {
   return new SlashCommandBuilder()
     .setName('dodge')
     .setDescription('Leave the match within 5 minutes after map bans (1 hour queue ban)');
-}
-
-export function getResetMatchCommand() {
-  return new SlashCommandBuilder()
-    .setName('reset-match')
-    .setDescription('Cancel an active match (admin only)')
-    .addChannelOption(option =>
-      option.setName('channel')
-        .setDescription('Match channel to reset')
-        .setRequired(true)
-        .addChannelTypes(ChannelType.GuildText)
-    );
-}
-
-export function getBanPlayerCommand() {
-  return new SlashCommandBuilder()
-    .setName('ban-player')
-    .setDescription('Ban a player from queue for a duration (admin only)')
-    .addUserOption(option =>
-      option.setName('player')
-        .setDescription('Player to ban')
-        .setRequired(true)
-    )
-    .addStringOption(option =>
-      option.setName('duration')
-        .setDescription('Ban duration (e.g. 30m, 2h, 1j)')
-        .setRequired(true)
-    );
-}
-
-export function getUnbanPlayerCommand() {
-  return new SlashCommandBuilder()
-    .setName('unban-player')
-    .setDescription('Unban a player from queue (admin only)')
-    .addUserOption(option =>
-      option.setName('player')
-        .setDescription('Player to unban')
-        .setRequired(true)
-    );
-}
-
-export function getEditPlayerStatsCommand() {
-  return new SlashCommandBuilder()
-    .setName('edit-player-stats')
-    .setDescription('Edit player stats (admin only)')
-    .addUserOption(option =>
-      option.setName('player')
-        .setDescription('Player to edit')
-        .setRequired(true)
-    );
 }
 
 export { getRankByPoints, syncPlayerRank, getQueue };

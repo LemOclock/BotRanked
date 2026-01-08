@@ -101,7 +101,7 @@ export function setupRegister(client) {
       if (interaction.isModalSubmit() && interaction.customId === 'register_modal') {
         // Ensure we acknowledge quickly to avoid timeouts
         if (!interaction.deferred && !interaction.replied) {
-          try { await interaction.deferReply({ ephemeral: true }); } catch {}
+          try { await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
         }
         const pseudo = interaction.fields.getTextInputValue('pseudo_input').trim();
         const guild = interaction.guild;
