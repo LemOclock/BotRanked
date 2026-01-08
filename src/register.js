@@ -10,9 +10,9 @@ const registerCooldowns = new Map(); // userId -> timestamp
 // Validate pseudo to prevent XSS/injection and ensure reasonable input
 function validatePseudo(pseudo) {
   if (!pseudo || typeof pseudo !== 'string') return false;
-  if (pseudo.length < 2 || pseudo.length > 100) return false;
-  // Allow alphanumeric, spaces, hyphens, underscores, accented characters
-  return /^[\w\s\-àâäæçéèêëîïôùûüœ]+$/i.test(pseudo);
+  if (pseudo.length < 2 || pseudo.length > 30) return false;
+  // Allow alphanumeric, spaces, hyphens, underscores, dot, square brackets, accented characters
+  return /^[\w\s\.\-\[\]àâäæçéèêëîïôùûüœ]+$/i.test(pseudo);
 }
 
 
@@ -42,8 +42,8 @@ export function setupRegister(client) {
       const guild = member.guild;
       const pseudo = user.username;
 
-      // Set nickname
-      try { await member.setNickname(pseudo); } catch {}
+      // Set nickname to the original format: "points - username"
+      try { await member.setNickname(`${user.points} - ${pseudo}`); } catch {}
 
       // Add role
       const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'membre');
@@ -80,9 +80,18 @@ export function setupRegister(client) {
         }
         
         registerCooldowns.set(userId, now);
+
+        // If already registered, do nothing and just show stored info
+        const already = await User.findOne({ where: { discordId: userId } });
+        if (already) {
+          const stats = `Pseudo: **${already.username}**\nPoints: **${already.points}**\nWins: **${already.wins}**\nLosses: **${already.losses}**`;
+          await interaction.reply({ flags: MessageFlags.Ephemeral, content: `Tu es déjà enregistré. Aucune modification effectuée.\n\n${stats}` });
+          return;
+        }
         
         const modal = new ModalBuilder().setCustomId('register_modal').setTitle('Enregistrement');
-        const input = new TextInputBuilder().setCustomId('pseudo_input').setLabel('Ton pseudo').setStyle(TextInputStyle.Short).setPlaceholder('Entrer votre pseudo').setRequired(true).setMaxLength(100);
+        const input = new TextInputBuilder().setCustomId('pseudo_input').setLabel('Ton pseudo').setStyle(TextInputStyle.Short).setPlaceholder('Entrer votre pseudo (2-30 caractères)')
+          .setRequired(true).setMaxLength(30);
         const row = new ActionRowBuilder().addComponents(input);
         modal.addComponents(row);
         await interaction.showModal(modal);
@@ -90,31 +99,25 @@ export function setupRegister(client) {
       }
 
       if (interaction.isModalSubmit() && interaction.customId === 'register_modal') {
+        // Ensure we acknowledge quickly to avoid timeouts
+        if (!interaction.deferred && !interaction.replied) {
+          try { await interaction.deferReply({ ephemeral: true }); } catch {}
+        }
         const pseudo = interaction.fields.getTextInputValue('pseudo_input').trim();
         const guild = interaction.guild;
         const member = interaction.member;
 
         // Validate pseudo input
         if (!validatePseudo(pseudo)) {
-          await interaction.reply({ flags: MessageFlags.Ephemeral, content: 'Invalid pseudo. Use 2-100 alphanumeric characters, spaces, hyphens, underscores.' });
+          await interaction.editReply({ content: 'Pseudo invalide. Autorisés: lettres, chiffres, espaces, _ - . [ ] (2-30 caractères).' });
           return;
         }
 
-        // If already registered, show their current info and re-assign role
+        // If already registered, show their current info and do not change anything
         const existing = await User.findOne({ where: { discordId: member.id } });
         if (existing) {
-          // Re-assign role and nickname
-          const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'membre');
-          if (role) {
-            try { await member.roles.add(role); } catch {}
-          }
-          try { await member.setNickname(`${existing.points} - ${existing.username}`); } catch {}
-
-          // Sync rank role
-          await syncPlayerRank(guild, member.id, existing.points);
-
           const stats = `Pseudo: **${existing.username}**\nPoints: **${existing.points}**\nWins: **${existing.wins}**\nLosses: **${existing.losses}**`;
-          await interaction.reply({ flags: MessageFlags.Ephemeral, content: `You're already registered!\n\n${stats}\n\n✅ Rôle **Membre** réattribué.` });
+          await interaction.editReply({ content: `Tu es déjà enregistré. Aucune modification effectuée.\n\n${stats}` });
           return;
         }
 
@@ -122,7 +125,7 @@ export function setupRegister(client) {
         const newUser = await User.create({ discordId: member.id, username: pseudo, registeredAt: new Date() }).catch(async (err) => {
           // Handle duplicate pseudo error
           if (err.name === 'SequelizeUniqueConstraintError') {
-            await interaction.reply({ flags: MessageFlags.Ephemeral, content: `The pseudo **${pseudo}** is already taken. Choose another one.` });
+            await interaction.editReply({ content: `The pseudo **${pseudo}** is already taken. Choose another one.` });
             return null;
           }
           throw err;
@@ -135,13 +138,13 @@ export function setupRegister(client) {
 
         const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'membre');
         if (!role) {
-          await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Rôle 'Membre' introuvable. Créez un rôle `Membre`." });
+          await interaction.editReply({ content: "Rôle 'Membre' introuvable. Créez un rôle `Membre`." });
           return;
         }
 
         try { await member.roles.add(role); }
         catch {
-          await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Impossible d'assigner le rôle. Vérifiez la hiérarchie et permissions du bot." });
+          await interaction.editReply({ content: "Impossible d'assigner le rôle. Vérifiez la hiérarchie et permissions du bot." });
           return;
         }
 
@@ -149,12 +152,14 @@ export function setupRegister(client) {
         await syncPlayerRank(guild, member.id, newUser.points);
 
         const parts = [`✅ Enregistré comme **${pseudo}**.`, 'Rôle **Membre** attribué.', nickOk ? 'Pseudo mis à jour.' : "Impossible de changer ton pseudo (permissions)." ];
-        await interaction.reply({ flags: MessageFlags.Ephemeral, content: parts.join(' ') });
+        await interaction.editReply({ content: parts.join(' ') });
         return;
       }
     } catch (err) {
       console.error('Register interaction error', err);
-      if (!interaction.replied) {
+      if (interaction?.deferred && !interaction.replied) {
+        try { await interaction.editReply({ content: 'Une erreur est survenue.' }); } catch {}
+      } else if (!interaction.replied) {
         try { await interaction.reply({ flags: MessageFlags.Ephemeral, content: 'Une erreur est survenue.' }); } catch {}
       }
     }

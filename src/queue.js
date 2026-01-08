@@ -734,6 +734,24 @@ export function setupQueue(client) {
     try {
       if (!interaction.isButton()) return;
 
+      // Helper to respond safely to button interactions (handles already-acknowledged cases)
+      const safeEphemeral = async (content) => {
+        try {
+          if (interaction.deferred) {
+            return await interaction.editReply({ content });
+          }
+          if (interaction.replied) {
+            return await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+          }
+          return await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+        } catch (e) {
+          // Swallow common Discord interaction race errors; log others
+          if (e?.code !== 10062 && e?.code !== 40060) {
+            console.error('Queue interaction reply error:', e);
+          }
+        }
+      };
+
       if (interaction.customId === "queue_join" || interaction.customId === "queue_leave") {
         const guild = interaction.guild;
         const guildId = guild.id;
@@ -757,7 +775,7 @@ export function setupQueue(client) {
         const now = Date.now();
         if (lastClick && (now - lastClick.timestamp) < BUTTON_COOLDOWN) {
           const timeLeft = Math.ceil((BUTTON_COOLDOWN - (now - lastClick.timestamp)) / 1000);
-          await interaction.reply({ content: `Please wait ${timeLeft}s before clicking again.`, flags: MessageFlags.Ephemeral });
+          await safeEphemeral(`Please wait ${timeLeft}s before clicking again.`);
           return;
         }
         buttonCooldowns.set(memberId, { timestamp: now, createdAt: now });
@@ -768,7 +786,7 @@ export function setupQueue(client) {
           // Check if already in another queue
           const otherQueue = isUserInOtherQueue(memberId, channelName, guildId);
           if (otherQueue) {
-            await interaction.reply({ content: `You are already in the ${otherQueue} queue. Please leave it first.`, flags: MessageFlags.Ephemeral });
+            await safeEphemeral(`You are already in the ${otherQueue} queue. Please leave it first.`);
             return;
           }
           
@@ -777,32 +795,32 @@ export function setupQueue(client) {
           if (requiredRoles && requiredRoles.length > 0) {
             const hasRole = interaction.member.roles.cache.some(r => requiredRoles.includes(r.name.toLowerCase()));
             if (!hasRole) {
-              await interaction.reply({ content: `You need one of these roles to join: ${requiredRoles.join(', ')}.`, flags: MessageFlags.Ephemeral });
+              await safeEphemeral(`You need one of these roles to join: ${requiredRoles.join(', ')}.`);
               return;
             }
           }
           
           if (isUserDodgeBanned(memberId)) {
             const timeLeft = getDodgeBanTimeLeft(memberId);
-            await interaction.reply({ content: `You are banned from queue for ${timeLeft} more minutes (dodged a match).`, flags: MessageFlags.Ephemeral });
+            await safeEphemeral(`You are banned from queue for ${timeLeft} more minutes (dodged a match).`);
             return;
           }
           if (isUserInActiveMatch(memberId)) {
-            await interaction.reply({ content: "You already in game.", flags: MessageFlags.Ephemeral });
+            await safeEphemeral("You already in game.");
             return;
           }
           q.add(memberId);
-          await interaction.reply({ content: "You joined the queue.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("You joined the queue.");
         } else {
           q.delete(memberId);
-          await interaction.reply({ content: "You left the queue.", flags: MessageFlags.Ephemeral });
+          await safeEphemeral("You left the queue.");
         }
 
         await updateQueueMessage(client, guild, channelName);
         await updateCurrentQueueMessage(client, guild);
 
         // Acquire lock to prevent race conditions when creating game
-        if (q.size >= QUEUE_SIZE) {
+        if (q.size >= QUEUE_SIZE && process.env.SIM_MODE !== '1') {
           const unlock = await acquireGameCreationLock(guildId, channelName);
           try {
             // Re-check queue size after acquiring lock (another request might have taken players)
@@ -1358,4 +1376,4 @@ export function getEditPlayerStatsCommand() {
     );
 }
 
-export { getRankByPoints, syncPlayerRank };
+export { getRankByPoints, syncPlayerRank, getQueue };
