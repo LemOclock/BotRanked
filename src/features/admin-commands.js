@@ -12,6 +12,7 @@ import { Match, User } from "../models/index.js";
 import { syncPlayerRank, getRankByPoints } from "../queue.js";
 
 const DODGE_BAN_DURATION = 60 * 60 * 1000; // 1 hour in ms
+const DODGE_TIME_LIMIT = 5 * 60 * 1000; // 5 minutes in ms
 
 /**
  * Setup all admin commands handlers
@@ -23,7 +24,7 @@ export function setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues)
     if (interaction.commandName !== 'ban-player') return;
 
     try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
+      const isAdmin = interaction.member.roles.cache.some(r => r.name.toLowerCase() === 'admin') || interaction.user.id === interaction.guild.ownerId;
       if (!isAdmin) {
         await interaction.reply({ content: 'Only admins can ban players.', flags: MessageFlags.Ephemeral });
         return;
@@ -77,7 +78,7 @@ export function setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues)
     if (interaction.commandName !== 'reset-match') return;
 
     try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
+      const isAdmin = interaction.member.roles.cache.some(r => r.name.toLowerCase() === 'admin') || interaction.user.id === interaction.guild.ownerId;
       if (!isAdmin) {
         await interaction.reply({ content: 'Only admins can reset matches.', flags: MessageFlags.Ephemeral });
         return;
@@ -119,7 +120,7 @@ export function setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues)
     if (interaction.commandName !== 'unban-player') return;
 
     try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
+      const isAdmin = interaction.member.roles.cache.some(r => r.name.toLowerCase() === 'admin') || interaction.user.id === interaction.guild.ownerId;
       if (!isAdmin) {
         await interaction.reply({ content: 'Only admins can unban players.', flags: MessageFlags.Ephemeral });
         return;
@@ -162,7 +163,7 @@ export function setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues)
     if (interaction.commandName !== 'edit-player-stats') return;
 
     try {
-      const isAdmin = interaction.member.roles.cache.some(r => r.name === 'admin') || interaction.user.id === interaction.guild.ownerId;
+      const isAdmin = interaction.member.roles.cache.some(r => r.name.toLowerCase() === 'admin') || interaction.user.id === interaction.guild.ownerId;
       if (!isAdmin) {
         await interaction.reply({ content: 'Only admins can edit player stats.', flags: MessageFlags.Ephemeral });
         return;
@@ -278,6 +279,138 @@ export function setupAdminCommands(client, dodgeBans, matches, voteUpdateQueues)
       }
     }
   });
+
+  // Handle /dodge command (player command during match)
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== 'dodge') return;
+
+    try {
+      // Defer immediately for slash commands
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+      
+      const channelId = interaction.channelId;
+      const state = matches.get(channelId);
+      const userId = interaction.user.id;
+
+      if (!state) {
+        await interaction.editReply({ content: 'This command can only be used in an active match channel.' });
+        return;
+      }
+
+      if (!state.players.has(userId)) {
+        await interaction.editReply({ content: 'Only players in this match can dodge.' });
+        return;
+      }
+
+      if (!state.voteStartTime) {
+        await interaction.editReply({ content: 'You can only dodge after the map bans are complete.' });
+        return;
+      }
+
+      const elapsedTime = Date.now() - state.voteStartTime;
+      if (elapsedTime > DODGE_TIME_LIMIT) {
+        await interaction.editReply({ content: 'Dodge window expired (5 minutes after map bans).' });
+        return;
+      }
+
+      // Ban the dodger for 1 hour
+      const banExpiry = Date.now() + DODGE_BAN_DURATION;
+      dodgeBans.set(userId, { timestamp: banExpiry, createdAt: Date.now() });
+
+      // Notify all players in the match
+      const playerMentions = [...state.players].map(id => `<@${id}>`).join(' ');
+      await interaction.channel.send(`**Match cancelled**: <@${userId}> dodged the match and is banned from queue for 1 hour.\n${playerMentions}`);
+
+      // Mark match as cancelled in DB
+      if (state.matchId) {
+        await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
+      }
+
+      // Clean up
+      matches.delete(channelId);
+      voteUpdateQueues.delete(state.matchId);
+
+      await interaction.editReply({ content: 'You dodged the match. You are banned from queue for 1 hour.' });
+
+      // Delete channel after 5 seconds
+      setTimeout(() => {
+        try { interaction.channel.delete().catch(() => {}); } catch {}
+      }, 5000);
+
+    } catch (err) {
+      console.error('Dodge command error:', err);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'Error executing dodge command.', flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if (interaction.deferred) {
+        await interaction.editReply({ content: 'Error executing dodge command.' }).catch(() => {});
+      }
+    }
+  });
+
+  // Handle /force-dodge command (admin only)
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== 'force-dodge') return;
+
+    try {
+      const isAdmin = interaction.member.roles.cache.some(r => r.name.toLowerCase() === 'admin') || interaction.user.id === interaction.guild.ownerId;
+      if (!isAdmin) {
+        await interaction.reply({ content: 'Only admins can force dodge.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // Defer immediately for slash commands
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+      
+      const targetUser = interaction.options.getUser('player');
+      const userId = targetUser.id;
+      const channelId = interaction.channelId;
+      const state = matches.get(channelId);
+
+      if (!state) {
+        await interaction.editReply({ content: 'This command can only be used in an active match channel.' });
+        return;
+      }
+
+      if (!state.players.has(userId)) {
+        await interaction.editReply({ content: 'Target player is not in this match.' });
+        return;
+      }
+
+      // Ban the dodger for 1 hour
+      const banExpiry = Date.now() + DODGE_BAN_DURATION;
+      dodgeBans.set(userId, { timestamp: banExpiry, createdAt: Date.now() });
+
+      // Notify all players in the match
+      const playerMentions = [...state.players].map(id => `<@${id}>`).join(' ');
+      await interaction.channel.send(`**Match cancelled**: <@${userId}> was force-dodged by an admin and is banned from queue for 1 hour.\n${playerMentions}`);
+
+      // Mark match as cancelled in DB
+      if (state.matchId) {
+        await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
+      }
+
+      // Clean up
+      matches.delete(channelId);
+      voteUpdateQueues.delete(state.matchId);
+
+      await interaction.editReply({ content: `<@${userId}> was force-dodged and banned from queue for 1 hour.` });
+
+      // Delete channel after 5 seconds
+      setTimeout(() => {
+        try { interaction.channel.delete().catch(() => {}); } catch {}
+      }, 5000);
+
+    } catch (err) {
+      console.error('Force dodge command error:', err);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'Error executing force dodge command.', flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if (interaction.deferred) {
+        await interaction.editReply({ content: 'Error executing force dodge command.' }).catch(() => {});
+      }
+    }
+  });
 }
 
 /**
@@ -329,6 +462,23 @@ export function getEditPlayerStatsCommand() {
     .addUserOption(option =>
       option.setName('player')
         .setDescription('Player to edit')
+        .setRequired(true)
+    );
+}
+
+export function getDodgeCommand() {
+  return new SlashCommandBuilder()
+    .setName('dodge')
+    .setDescription('Leave the match within 5 minutes after map bans (1 hour queue ban)');
+}
+
+export function getForceDodgeCommand() {
+  return new SlashCommandBuilder()
+    .setName('force-dodge')
+    .setDescription('Force a player to dodge the match (admin only)')
+    .addUserOption(option =>
+      option.setName('player')
+        .setDescription('Player to force dodge')
         .setRequired(true)
     );
 }

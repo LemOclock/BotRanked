@@ -5,7 +5,7 @@ import { Client, GatewayIntentBits, Events, REST, Routes } from 'discord.js';
 import sequelize from './database.js';
 import { ensureRegisterMessage, setupRegister } from './register.js';
 import { ensureQueueMessage, setupQueue, getDodgeCommand } from './queue.js';
-import { getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from './features/admin-commands.js';
+import { getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand, getForceDodgeCommand } from './features/admin-commands.js';
 import { setupStats, getLeaderboardCommand, getStatsCommand, ensureStatsAndLeaderboardMessages } from './stats.js';
 import { setupTickets, getDeleteTicketCommand, getInvitePlayerTicketCommand, ensureTicketMessage } from './tickets.js';
 
@@ -53,7 +53,8 @@ client.once(Events.ClientReady, async () => {
           getResetMatchCommand().toJSON(),
           getBanPlayerCommand().toJSON(),
           getUnbanPlayerCommand().toJSON(),
-          getEditPlayerStatsCommand().toJSON()
+          getEditPlayerStatsCommand().toJSON(),
+          getForceDodgeCommand().toJSON()
         ];
         await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: commands });
         console.log(`Slash commands registered for guild ${guild.name}`);

@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: botranked
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CLIENT_ID=${CLIENT_ID}
+      - DATABASE_URL=${DATABASE_URL}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_SYNC_ON_START=${DB_SYNC_ON_START:-0}
+      - SIM_MODE=${SIM_MODE:-0}
+      - POINTS_WIN=${POINTS_WIN:-30}
+      - POINTS_LOSS=${POINTS_LOSS:-30}
+    restart: unless-stopped
+    networks:
+      - botranked-network
+
+  # Optional: PostgreSQL database
+  db:
+    image: postgres:15-alpine
+    container_name: botranked-db
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - botranked-network
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
+
+networks:
+  botranked-network:
+    driver: bridge

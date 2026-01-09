@@ -5,7 +5,7 @@ import { syncPlayerRankLimiter, userUpdateLimiter } from "./utils/rate-limiter.j
 import { startMemoryCleanup } from "./utils/memory-cleanup.js";
 import { getCachedUser, invalidateUserCache } from "./utils/user-cache.js";
 import { ensureCurrentQueueMessage, scheduleCurrentQueueUpdate } from "./features/current-queue.js";
-import { setupAdminCommands, getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand } from "./features/admin-commands.js";
+import { setupAdminCommands, getResetMatchCommand, getBanPlayerCommand, getUnbanPlayerCommand, getEditPlayerStatsCommand, getDodgeCommand, getForceDodgeCommand } from "./features/admin-commands.js";
 
 const QUEUE_CHANNEL_NAME = "v3-general";
 const QUEUE_ADVANCED_CHANNEL_NAME = "v3-advanced";
@@ -22,8 +22,6 @@ const POINTS_WIN = Number(process.env.POINTS_WIN || 30);
 const POINTS_LOSS = Number(process.env.POINTS_LOSS || 30);
 const MAPS = ["Temple-M", "Old-School", "Neden-3", "Tunnel", "Colloseum", "Ziggurant", "Jungle"];
 const BUTTON_COOLDOWN = 3000; // 3 seconds cooldown
-const DODGE_BAN_DURATION = 60 * 60 * 1000; // 1 hour in ms
-const DODGE_TIME_LIMIT = 5 * 60 * 1000; // 5 minutes in ms
 const COOLDOWN_TTL = 60 * 60 * 1000; // Cleanup cooldowns after 1 hour
 const MATCH_TTL = 12 * 60 * 60 * 1000; // Cleanup match states after 12 hours (fail-safe)
 
@@ -684,63 +682,6 @@ export function setupQueue(client) {
         }
       };
 
-      // Handle slash commands first (before button check)
-      if (interaction.isChatInputCommand() && interaction.commandName === 'dodge') {
-        // Defer immediately for slash commands
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
-        
-        const channelId = interaction.channelId;
-        const state = matches.get(channelId);
-        const userId = interaction.user.id;
-
-        if (!state) {
-          await interaction.editReply({ content: 'This command can only be used in an active match channel.' });
-          return;
-        }
-
-        if (!state.players.has(userId)) {
-          await interaction.editReply({ content: 'Only players in this match can dodge.' });
-          return;
-        }
-
-        if (!state.voteStartTime) {
-          await interaction.editReply({ content: 'You can only dodge after the map bans are complete.' });
-          return;
-        }
-
-        const elapsedTime = Date.now() - state.voteStartTime;
-        if (elapsedTime > DODGE_TIME_LIMIT) {
-          await interaction.editReply({ content: 'Dodge window expired (5 minutes after map bans).' });
-          return;
-        }
-
-        // Ban the dodger for 1 hour
-        const banExpiry = Date.now() + DODGE_BAN_DURATION;
-        dodgeBans.set(userId, { timestamp: banExpiry, createdAt: Date.now() });
-
-        // Notify all players in the match
-        const playerMentions = [...state.players].map(id => `<@${id}>`).join(' ');
-        await interaction.channel.send(`**Match cancelled**: <@${userId}> dodged the match and is banned from queue for 1 hour.\n${playerMentions}`);
-
-        // Mark match as cancelled in DB
-        if (state.matchId) {
-          await Match.update({ status: 'cancelled' }, { where: { id: state.matchId } }).catch(() => {});
-        }
-
-        // Clean up
-        matches.delete(channelId);
-        voteUpdateQueues.delete(state.matchId);
-
-        await interaction.editReply({ content: 'You dodged the match. You are banned from queue for 1 hour.' });
-
-        // Delete channel after 5 seconds
-        setTimeout(() => {
-          try { interaction.channel.delete().catch(() => {}); } catch {}
-        }, 5000);
-
-        return;
-      }
-
       // Handle button interactions
       if (!interaction.isButton()) return;
 
@@ -1044,12 +985,6 @@ export function setupQueue(client) {
       }
     }
   });
-}
-
-export function getDodgeCommand() {
-  return new SlashCommandBuilder()
-    .setName('dodge')
-    .setDescription('Leave the match within 5 minutes after map bans (1 hour queue ban)');
 }
 
 export { getRankByPoints, syncPlayerRank, getQueue };
