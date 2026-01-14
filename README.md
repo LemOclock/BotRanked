@@ -10,10 +10,12 @@ Bot Discord développé en **Node.js**, conteneurisé avec **Docker** et utilisa
 Le fichier `.env` contient :
 - le token Discord
 - les identifiants PostgreSQL
+- 
 
 👉 Assure-toi qu’il est bien présent dans le `.gitignore`.
 
 ---
+
 
 ## ✅ Pré-requis
 
@@ -30,10 +32,12 @@ https://www.dropvps.com/blog/build-discord-bot-on-ubuntu-25-04/
 
 ## 📦 Installation
 
+
 ```bash
 mkdir -p /var/www/bot-discord/BotRanked
 cd /var/www/bot-discord/BotRanked
 ```
+
 
 ### Arborescence du projet 
 ```
@@ -48,7 +52,9 @@ BotRanked/
 ```
 
 
+
 ### ⚙️ Configuration 
+
 
 .env : 
 ```
@@ -58,6 +64,7 @@ NODE_ENV=production
 DATABASE_URL=postgres://[USERBOT]:[PWSD]@postgres:5432/[USERDB]
 BOT_TOKEN=[TOKENBOTDISCORD]
 ```
+
 
 docker-compose.yml
 ```
@@ -86,6 +93,7 @@ services:
 	  postgres_data:
 ```
 
+
 Dockerfile : 
 ```
 	FROM node:20-alpine
@@ -95,6 +103,7 @@ Dockerfile :
 	COPY . .
 	CMD ["npm", "start"]
 ```
+
 
 .gitignore : 
 ```
@@ -122,7 +131,7 @@ docker compose ps
 
 ### Resultat attendu
 ```bash
-  bot-postgres   postgres:16    postgres   5432/tcp
+  bot-postgres   postgres:16    postgres   
 	discord-bot    botranked-discord-bot  discord-bot  
 ```
 
@@ -135,15 +144,18 @@ docker compose logs -f discord-bot
 
 ## 🛠️ Commande utiles :
 
+
 Redemarrer le bot :
 ```bash
 docker compose restart discord-bot
 ```
 
+
 Arret du containers :
 ```bash
 docker compose down
 ```
+
 
 Supprimer la base de données : 
 ```bash
