@@ -36,6 +36,7 @@ cd /var/www/bot-discord/BotRanked
 ```
 
 ### Arborescence du projet 
+```
 BotRanked/
 ├── src/                 # Code du bot Discord
 ├── package.json
@@ -44,6 +45,7 @@ BotRanked/
 ├── docker-compose.yml
 ├── .env                 # ❌ Ne pas commit
 └── README.md
+```
 
 
 ### ⚙️ Configuration 
